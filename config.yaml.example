@@ -1,0 +1,17 @@
+# ds-proxy 配置模板（复制为 config.yaml 使用）
+listen_host: "127.0.0.1"
+listen_port: 8787
+
+upstream:
+  base: "https://api.deepseek.com"
+  chat_path: "/chat/completions"
+  responses_path: "/v1/responses"
+
+log_file: "proxy.log"
+
+# 会话启动阶段注入工具优先引导
+inject_guide: true
+
+# 启用增强的模型白名单（其他模型纯透传）
+mask_models:
+  - "deepseek-v4-pro"
