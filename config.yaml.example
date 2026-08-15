@@ -15,3 +15,20 @@ inject_guide: true
 # 启用增强的模型白名单（其他模型纯透传）
 mask_models:
   - "deepseek-v4-pro"
+
+# ── v0.3 任务分类路由（吸收自 dsh-router-standard v0.1.0）──
+# mode 从请求首条 user 消息派生：spec（修复/重构→计划-集体）/ react（开发/构建→执行者）/
+# weak（平局→模型自路由）。persona 按模式全程固定；行为指令走 user 通道引导。
+router:
+  enabled: true
+  # 实验开关：完整 band persona（行为指令进 system）
+  persona_full_band: false
+  # weak 模式近场引导：每条 user 消息后注入（spec/react 用首轮引导）
+  weak_guide: true
+  # 复杂任务（>120 字符或架构措辞）→ 深度引导
+  deep_guide: true
+  # we-steer：思维链轨迹矫正——响应 reasoning 中复数集体标记
+  # （we need/let's/we'll/we can/we should）计数 < 单数个体标记
+  # （let me/i'll/i can/i should/i need/my）时，下一轮启动阶段请求注入
+  # "We DeepSeek: We think IN English, start 'we need'."
+  we_steer: true

@@ -157,4 +157,102 @@ check("event separator is a TRUE blank line", out[1] == "\n")  # SSE 规范：�
 check("original line passthrough without newline", not out[2].endswith("\n"))
 check("flush keeps tool id", 'id": "c1"' in "".join(out))
 
+# ── v0.3 任务分类路由（吸收自 dsh-router-standard）──
+
+check("classify react", router.classify_task("帮我写一个 Python 脚本处理日志") == "react")
+check("classify react en", router.classify_task("build a new project from scratch") == "react")
+check("classify spec", router.classify_task("修复这个崩溃的 bug") == "spec")
+check("classify spec en", router.classify_task("fix the broken build") == "spec")
+check("classify mixed counts", router.classify_task("帮我开发一个网站并实现登录功能，修复一些 bug") == "react")  # 3 react vs 1 spec
+check("classify weak ambiguous", router.classify_task("你好") == "weak")
+check("classify weak empty", router.classify_task("") == "weak")
+
+check("complex long", router.is_complex_task("x" * 150))
+check("complex not short", not router.is_complex_task("修复一下"))
+check("complex arch word", router.is_complex_task("系统架构重构"))
+
+body = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "修复这个崩溃"}]}
+check("session_mode first user", router.session_mode(body) == "spec")
+body2 = {"messages": [{"role": "user", "content": "写一个游戏"}]}
+check("session_mode react", router.session_mode(body2) == "react")
+body3 = {"input": [{"role": "user", "content": [{"type": "text", "text": "随便聊聊"}]}]}
+check("session_mode weak responses", router.session_mode(body3) == "weak")
+check("session_mode no user", router.session_mode({"messages": [{"role": "assistant", "content": "x"}]}) == "weak")
+
+body4 = {"messages": [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, {"role": "user", "content": [{"type": "text", "text": "c"}]}]}
+check("last_user_text", router.last_user_text(body4) == "c")
+check("last_user_text responses", router.last_user_text({"input": [{"role": "user", "content": "z"}]}) == "z")
+
+# 模式 persona 分档
+check("spec persona identity", wire.build_pseudo_system("", "spec") == wire.SPEC_PERSONA)
+check("react persona identity", wire.build_pseudo_system("", "react") == "You are a hands-on software engineer who delivers working output fast.")
+check("weak persona identity", wire.build_pseudo_system("", "weak") == wire.WEAK_PRO.split("\n")[0])
+check("full_band react", wire.build_pseudo_system("", "react", full_band=True) == wire.REACT_PERSONA)
+check("full_band weak", wire.build_pseudo_system("", "weak", full_band=True) == wire.WEAK_PRO)
+check("mode rules appended", wire.build_pseudo_system("R1", "react").endswith("R1"))
+
+# 分档引导
+check("guide spec", wire.guide_for("spec", "x") == wire.GUIDE_SPEC)
+check("guide react", wire.guide_for("react", "x") == wire.GUIDE_REACT)
+check("guide weak simple", wire.guide_for("weak", "修复一下") == wire.GUIDE_WEAK)
+check("guide weak complex", wire.guide_for("weak", "x" * 150) == wire.GUIDE_DEEP)
+check("guide deep off", wire.guide_for("weak", "x" * 150, deep_guide=False) == wire.GUIDE_WEAK)
+
+body = {"messages": [{"role": "user", "content": "t"}]}
+body = wire.inject_guide(body, "chat", wire.GUIDE_REACT)
+check("custom guide injected", body["messages"][0]["content"].endswith(wire.GUIDE_REACT))
+
+# ── we-steer 思维链轨迹统计 ───────────────────────────────────────────
+
+tr = translate.ChatTranslator()
+tr.feed('data: {"choices": [{"delta": {"reasoning_content": "We need to check the structure. Let me inspect the repo first."}}]}')
+check("chat reason count", tr.collective_count == 1 and tr.individual_count == 1)
+tr.feed('data: {"choices": [{"delta": {"reasoning_content": "Let me try again. we need one more fix."}}]}')
+check("chat reason accumulate", tr.collective_count == 2 and tr.individual_count == 2)
+
+# 复数集体标记集：let's / we'll / we should / we can 计入集体侧
+tr = translate.ChatTranslator()
+tr.feed('data: {"choices": [{"delta": {"reasoning_content": "Let\'s run pwd and ls. We\'ll inspect files via terminal. We can check git status. We should verify."}}]}')
+check("collective markers count", tr.collective_count == 4 and tr.individual_count == 0)
+
+# 单数个体标记集：i'll / i can / i should / i need / my 计入个体侧
+tr = translate.ChatTranslator()
+tr.feed('data: {"choices": [{"delta": {"reasoning_content": "Let me try. I\'ll check the file. I can fix it. I should verify. I need more info. My approach is X."}}]}')
+check("individual markers count", tr.collective_count == 0 and tr.individual_count == 6)
+
+# can't 否定不误计（we can't / i can't 不是轨迹标记）
+tr = translate.ChatTranslator()
+tr.feed('data: {"choices": [{"delta": {"reasoning_content": "We can\'t do this. I can\'t access that."}}]}')
+check("can't not counted", tr.collective_count == 0 and tr.individual_count == 0)
+
+# 跨片断词：token 分片把 "we nee" + "d" 切开仍应计 1
+tr = translate.ChatTranslator()
+tr.feed('data: {"choices": [{"delta": {"reasoning_content": "hmm we nee"}}]}')
+check("split none yet", tr.collective_count == 0)
+tr.feed('data: {"choices": [{"delta": {"reasoning_content": "d more time"}}]}')
+check("split counted", tr.collective_count == 1)
+
+# 触发条件：collective < individual
+tr = translate.ChatTranslator()
+tr.feed('data: {"choices": [{"delta": {"reasoning_content": "Let me check. Let me run it."}}]}')
+check("steer trigger cond", tr.collective_count < tr.individual_count)
+tr2 = translate.ChatTranslator()
+tr2.feed('data: {"choices": [{"delta": {"reasoning_content": "Let\'s check. We\'ll run it."}}]}')
+check("steer no trigger (lets/well collective)", not (tr2.collective_count < tr2.individual_count))
+tr3 = translate.ChatTranslator()
+tr3.feed('data: {"choices": [{"delta": {"reasoning_content": "We need this. We need that."}}]}')
+check("steer no trigger (we need)", not (tr3.collective_count < tr3.individual_count))
+
+# responses 协议 reasoning delta
+tr = translate.ResponsesTranslator()
+out = tr.feed('data: {"type": "response.reasoning_text.delta", "delta": "We need to plan. Let me check the docs."}')
+check("responses reason pass through", len(out) == 1)
+check("responses reason count", tr.collective_count == 1 and tr.individual_count == 1)
+
+# we-steer 注入文本
+body = {"messages": [{"role": "user", "content": "hi"}]}
+body = wire.inject_guide(body, "chat", wire.WE_STEER_TEXT)
+check("we-steer text injected", body["messages"][0]["content"].endswith(wire.WE_STEER_TEXT))
+check("we-steer exact text", wire.WE_STEER_TEXT.strip() == "We DeepSeek: We think IN English, start 'we need'.")
+
 print("\nALL TESTS PASSED")

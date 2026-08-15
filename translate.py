@@ -10,6 +10,16 @@
 from __future__ import annotations
 
 import json
+import re
+
+# 思维链轨迹统计（we-steer 触发源）：复数集体轨迹 vs 单数个体轨迹。
+# 标记集来自 440 条真实思维链的 KMeans 二分验证（2026-08-15）：
+#   集体 = we need / let's / we'll / we can / we should
+#   个体 = let me / i'll / i can / i should / i need / my
+# （let's/we'll 与 we need 同侧 79-80%，let me 对侧 87%；we need 本身跨类不是判别标记）
+_COLLECTIVE_RE = re.compile(r"\b(?:we\s+need|let's|we'll|we\s+can(?!')|we\s+should)\b", re.I)
+_INDIVIDUAL_RE = re.compile(r"\b(?:let\s+me|i'll|i\s+can(?!')|i\s+should|i\s+need|my)\b", re.I)
+_REASON_TAIL = 12  # 重叠窗口：防 token 分片把词切断（"we nee" + "d"）漏计
 
 
 def transform_tool_call(name: str, args_str: str) -> tuple[str, str]:
@@ -70,6 +80,16 @@ class ChatTranslator:
     def __init__(self):
         self._buf: dict[int, dict] = {}  # index -> {name, args, id}
         self._started: dict[int, bool] = {}
+        # 思维链轨迹统计（we-steer）：reasoning_content delta 实时计数
+        self.collective_count = 0
+        self.individual_count = 0
+        self._reason_tail = ""
+
+    def _count_reasoning(self, text: str) -> None:
+        buf = self._reason_tail + text
+        self.collective_count += len(_COLLECTIVE_RE.findall(buf))
+        self.individual_count += len(_INDIVIDUAL_RE.findall(buf))
+        self._reason_tail = text[-_REASON_TAIL:]
 
     def feed(self, line: str) -> list[str]:
         if not line.startswith("data:"):
@@ -87,6 +107,9 @@ class ChatTranslator:
         ch = choices[0]
         delta = ch.get("delta") or {}
         finish = ch.get("finish_reason")
+        rc = delta.get("reasoning_content")
+        if isinstance(rc, str) and rc:
+            self._count_reasoning(rc)
         tcs = _extract_tool_calls(delta)
         if not tcs:
             if finish == "tool_calls":
@@ -125,6 +148,10 @@ class ResponsesTranslator:
 
     def __init__(self):
         self._pending: dict[str, dict] = {}  # call_id -> {name, args}
+        # 思维链轨迹统计（we-steer）：response.reasoning_text.delta 实时计数
+        self.collective_count = 0
+        self.individual_count = 0
+        self._reason_tail = ""
 
     def feed(self, line: str) -> list[str]:
         if not line.startswith("data:"):
@@ -137,6 +164,14 @@ class ResponsesTranslator:
         except json.JSONDecodeError:
             return [line]
         t = ev.get("type", "")
+        if t == "response.reasoning_text.delta":
+            d = ev.get("delta")
+            if isinstance(d, str) and d:
+                buf = self._reason_tail + d
+                self.collective_count += len(_COLLECTIVE_RE.findall(buf))
+                self.individual_count += len(_INDIVIDUAL_RE.findall(buf))
+                self._reason_tail = d[-_REASON_TAIL:]
+            return [line]  # reasoning 透传
         if t == "response.output_item.added":
             item = ev.get("item") or ev.get("output_item") or {}
             if isinstance(item, dict) and item.get("type") == "function_call":

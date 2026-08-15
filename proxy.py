@@ -34,6 +34,24 @@ log = logging.getLogger("dsh-proxy")
 
 STATS = {"total": 0, "masked": 0, "anchored": 0, "translated_calls": 0, "errors": 0}
 
+# ── we-steer pending 状态（进程级；本地单客户端——无状态代理的跨轮记忆）──
+# 上一轮增强响应 reasoning 中 We need < Let me → 置位；下一轮启动阶段请求消费并清除。
+_WE_STEER = {"pending": False, "at": 0.0}
+_WE_STEER_TTL = 600.0  # 10 分钟：防用户中断后残留误注入远期轮次
+
+
+def _we_steer_set() -> None:
+    _WE_STEER["pending"] = True
+    _WE_STEER["at"] = time.time()
+
+
+def _we_steer_pending() -> bool:
+    return _WE_STEER["pending"] and (time.time() - _WE_STEER["at"]) < _WE_STEER_TTL
+
+
+def _we_steer_clear() -> None:
+    _WE_STEER["pending"] = False
+
 # 上游渠道标识：与官方 harness 客户端一致的匿名标识（进程级固定 UUID）
 import uuid as _uuid
 HARNESS_USER_ID = str(_uuid.uuid4())
@@ -50,6 +68,21 @@ class Config:
     log_file: str = "proxy.log"
     base_dir: str = "."  # config 文件所在目录：相对路径的基准
     inject_guide: bool = True
+    # v0.3：任务分类路由（吸收自 dsh-router-standard v0.1.0）
+    # mode 从请求历史第一条 user 消息派生（spec/react/weak），persona 全程固定；
+    # 行为指令走 user 通道引导，system 只换身份句。
+    router_enabled: bool = True
+    # 实验开关：完整 band persona（行为指令进 system）
+    persona_full_band: bool = False
+    # weak 模式近场引导：每轮注入（spec/react 用首轮引导）
+    weak_guide: bool = True
+    # 复杂任务（>120 字符或架构措辞）→ 深度引导
+    deep_guide: bool = True
+    # we-steer：思维链轨迹矫正——响应 reasoning 中复数集体标记
+    # （we need/let's/we'll/we can/we should）计数 < 单数个体标记
+    # （let me/i'll/i can/i should/i need/my）时，下一轮启动阶段请求注入
+    # "We DeepSeek: We think IN English, start 'we need'."
+    we_steer: bool = True
     # 按 model 分流：只有白名单内的模型启用增强，其余纯透传
     mask_models: list = field(default_factory=lambda: ["deepseek-v4-pro"])
 
@@ -69,6 +102,12 @@ class Config:
         c.log_file = data.get("log_file", c.log_file)
         c.inject_guide = bool(data.get("inject_guide", True))
         c.mask_models = list(data.get("mask_models", c.mask_models))
+        r = data.get("router", {}) or {}
+        c.router_enabled = bool(r.get("enabled", True))
+        c.persona_full_band = bool(r.get("persona_full_band", False))
+        c.weak_guide = bool(r.get("weak_guide", True))
+        c.deep_guide = bool(r.get("deep_guide", True))
+        c.we_steer = bool(r.get("we_steer", True))
         # 相对路径以 config 目录为基准（从任意 cwd 启动都稳定）
         if c.log_file and not os.path.isabs(c.log_file):
             c.log_file = os.path.join(c.base_dir, c.log_file)
@@ -84,6 +123,9 @@ class Translator:
         self.count = 0
         self.usage_seen = 0
         self.done_seen = 0
+        # 思维链轨迹统计（we-steer）：随 feed 更新，响应结束时读取
+        self.collective = 0
+        self.individual = 0
 
     def feed(self, proto: str, line: bytes) -> list[bytes]:
         text = line.decode("utf-8", errors="replace")
@@ -93,8 +135,10 @@ class Translator:
             self.done_seen += 1
         if proto == "chat":
             out = self.chat.feed(text)
+            self.collective, self.individual = self.chat.collective_count, self.chat.individual_count
         else:
             out = self.responses.feed(text)
+            self.collective, self.individual = self.responses.collective_count, self.responses.individual_count
         self.count += 1
         return [ln.encode("utf-8") for ln in out]
 
@@ -127,16 +171,31 @@ async def handle_request(request: web.Request, proto: str, cfg: Config, api_key:
 
     model = body.get("model")
     is_masked_model = model in cfg.mask_models
+
+    # v0.3 任务分类路由：mode 从首条 user 消息派生（无状态、resume-safe），
+    # persona 按模式全程固定（mode 一经锚定不换，tail persona 无效）。
+    mode = "spec"
+    if is_masked_model and cfg.router_enabled:
+        mode = router.session_mode(body)
+
     # 精简 system 全程保持（仅白名单模型）；非白名单模型纯透传。
     if is_masked_model:
-        body = wire.replace_system(body, wire.build_pseudo_system(), proto)
+        body = wire.replace_system(body, wire.build_pseudo_system("", mode, cfg.persona_full_band), proto)
     masked = False
     if not anchored and is_masked_model:
         masked = True
         STATS["masked"] += 1
         body = wire.replace_tools(body, wire.build_pseudo_tools(), proto)
         if cfg.inject_guide:
-            body = wire.inject_guide(body, proto)
+            # 按模式分档引导：spec=inspect-first；react=produce-verify-fix；
+            # weak=近场引导（复杂度自适应 deep_guide）。全走 user 通道。
+            if mode != "weak" or cfg.weak_guide:
+                last = router.last_user_text(body)
+                body = wire.inject_guide(body, proto, wire.guide_for(mode, last, cfg.deep_guide))
+        if cfg.we_steer and _we_steer_pending():
+            _we_steer_clear()
+            body = wire.inject_guide(body, proto, wire.WE_STEER_TEXT)
+            log.info("we-steer: injected into next unanchored request")
 
     path = cfg.responses_path if proto == "responses" else cfg.chat_path
     url = cfg.upstream_base.rstrip("/") + path
@@ -179,6 +238,10 @@ async def handle_request(request: web.Request, proto: str, cfg: Config, api_key:
         if masked and tr:
             STATS["translated_calls"] += tr.count
             log.info("usage_seen=%s done_seen=%s", tr.usage_seen, tr.done_seen)
+            if cfg.we_steer and tr.collective < tr.individual:
+                _we_steer_set()
+                log.info("we-steer: triggered (collective=%s < individual=%s), pending for next request",
+                         tr.collective, tr.individual)
 
     elapsed = time.time() - t0
     log.info("proto=%s model=%s anchored=%s masked=%s upstream=%s elapsed=%.2fs",
@@ -207,6 +270,13 @@ async def status_handler(request: web.Request) -> web.Response:
             "upstream": cfg.upstream_base,
             "mask_models": cfg.mask_models,
             "masked_system": "always (mask models only)",
+            "router": {
+                "enabled": cfg.router_enabled,
+                "persona_full_band": cfg.persona_full_band,
+                "weak_guide": cfg.weak_guide,
+                "deep_guide": cfg.deep_guide,
+                "we_steer": cfg.we_steer,
+            },
         },
     })
 

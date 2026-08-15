@@ -1,0 +1,16 @@
+# Secrets / local env
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Local config (copy config.yaml.example -> config.yaml)
+config.yaml
+
+# Logs
+*.log
