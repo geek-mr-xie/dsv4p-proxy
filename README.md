@@ -1,4 +1,4 @@
-# ds-proxy — DeepSeek V4 agent 代理层
+# dsv4p-proxy — DeepSeek V4 agent 代理层
 
 一个轻量本地代理，位于 agent 客户端与 DeepSeek API 之间，为 V4 系列模型提供
 harness 兼容的请求整形与工具调用适配。
